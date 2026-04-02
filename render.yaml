@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: scrappy-east
+    env: python
+    region: oregon
+    plan: starter
+    buildCommand: pip install -r requirements.txt && playwright install chromium && playwright install-deps
+    startCommand: gunicorn app:app
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: BASE44_ENABLED
+        value: false  # Set to true when ready
+      - key: INTERNAL_SECRET
+        generateValue: true
+      - key: EAST_COAST_ORGANIZATION_ID
+        value: YOUR_EAST_COAST_ORG_ID_HERE
+      - key: BASE44_APP_ID
+        value: 69ac768167fa5ab007eb6ae7
+      - key: BASE44_DOMAIN
+        value: agentbmanscraper.base44.app
+      - key: MAX_CITIES_PER_JOB
+        value: 5
