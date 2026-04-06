@@ -1,6 +1,15 @@
 """
 Philadelphia L&I Permit Scraper
 Uses the Philadelphia ArcGIS Feature Service — no JavaScript required.
+
+Data returned per permit:
+  - address + zip (full mailing address)
+  - opa_owner (property owner name — the homeowner)
+  - approvedscopeofwork (system size, panel model, inverter)
+  - contractorname / contractoraddress1
+  - status, issuedDate, propertyType (Residential/Commercial)
+
+Phone/email NOT in permit data — enriched downstream via Apollo/Hunter.
 """
 
 import requests
@@ -14,49 +23,54 @@ ARCGIS_URL = (
     '/permits/FeatureServer/0/query'
 )
 
-SOLAR_KEYWORDS = ['solar', 'photovoltaic', 'pv panel', 'pv system', 'pv module']
-
-
-def _is_solar(p: dict) -> bool:
-    text = ' '.join([
-        p.get('typeofwork', '') or '',
-        p.get('approvedscopeofwork', '') or '',
-    ]).lower()
-    return any(kw in text for kw in SOLAR_KEYWORDS)
-
 
 def scrape_philadelphia_api(start_date: str, end_date: str) -> list:
     """
     Scrape Philadelphia electrical permits via ArcGIS Feature Service,
-    filter for solar, return list of permit dicts.
+    filtered for solar at the query level.
 
     Args:
         start_date: 'YYYY-MM-DD'
         end_date:   'YYYY-MM-DD'
+
+    Returns:
+        List of solar permit dicts ready for Base44 ingest.
     """
     log.info(f'[Philadelphia] Scraping {start_date} to {end_date}')
 
     start_ts = f"{start_date} 00:00:00"
     end_ts   = f"{end_date} 23:59:59"
 
+    # Filter solar at the DB level — faster, less data transferred
     where = (
         f"permittype = 'ELECTRICAL' "
         f"AND permitissuedate >= '{start_ts}' "
-        f"AND permitissuedate <= '{end_ts}'"
+        f"AND permitissuedate <= '{end_ts}' "
+        f"AND ("
+        f"  LOWER(approvedscopeofwork) LIKE '%solar%' OR "
+        f"  LOWER(approvedscopeofwork) LIKE '%photovoltaic%' OR "
+        f"  LOWER(approvedscopeofwork) LIKE '%pv system%' OR "
+        f"  LOWER(approvedscopeofwork) LIKE '%pv module%' OR "
+        f"  LOWER(typeofwork) LIKE '%solar%'"
+        f")"
     )
 
-    permits = []
+    out_fields = (
+        'permitnumber,address,zip,permittype,typeofwork,approvedscopeofwork,'
+        'status,permitissuedate,commercialorresidential,'
+        'opa_owner,opa_account_num,'
+        'contractorname,contractoraddress1,'
+        'council_district,censustract'
+    )
+
+    permits  = []
     offset   = 0
     page_size = 1000
 
     while True:
         params = {
             'where':             where,
-            'outFields':         (
-                'permitnumber,address,permittype,typeofwork,approvedscopeofwork,'
-                'status,permitissuedate,contractorname,contractoraddress1,'
-                'opa_owner,commercialorresidential'
-            ),
+            'outFields':         out_fields,
             'f':                 'json',
             'resultRecordCount': page_size,
             'resultOffset':      offset,
@@ -83,31 +97,40 @@ def scrape_philadelphia_api(start_date: str, end_date: str) -> list:
 
             for f in features:
                 p = f.get('attributes', {})
-                if not _is_solar(p):
-                    continue
 
-                # ArcGIS returns dates as epoch milliseconds
+                # ArcGIS returns dates as epoch milliseconds → YYYY-MM-DD
                 issued = p.get('permitissuedate')
                 if isinstance(issued, (int, float)) and issued:
                     issued = datetime.utcfromtimestamp(issued / 1000).strftime('%Y-%m-%d')
 
+                # Full street address with zip
+                address      = p.get('address', '') or ''
+                zip_code     = p.get('zip', '') or ''
+                full_address = f"{address}, Philadelphia, PA {zip_code}".strip(', ')
+
                 permits.append({
-                    'permitNumber':   p.get('permitnumber'),
-                    'address':        p.get('address'),
-                    'description':    p.get('approvedscopeofwork') or p.get('typeofwork'),
-                    'status':         p.get('status'),
-                    'issuedDate':     issued,
-                    'appliedDate':    None,
-                    'applicantName':  p.get('opa_owner'),
-                    'contractorName': p.get('contractorname'),
-                    'contractorAddr': p.get('contractoraddress1'),
-                    'propertyType':   p.get('commercialorresidential'),
-                    'city':           'Philadelphia',
-                    'state':          'PA',
-                    'source':         'philadelphia_arcgis',
+                    'permitNumber':    p.get('permitnumber'),
+                    'address':         full_address,
+                    'streetAddress':   address,
+                    'zip':             zip_code,
+                    'description':     p.get('approvedscopeofwork') or p.get('typeofwork'),
+                    'status':          p.get('status'),
+                    'issuedDate':      issued,
+                    'ownerName':       p.get('opa_owner'),       # e.g. "MALTBY MARK DANIEL"
+                    'opaAccountNum':   p.get('opa_account_num'), # OPA parcel ID
+                    'contractorName':  p.get('contractorname'),
+                    'contractorAddr':  (p.get('contractoraddress1') or '').replace('\r\n', ', '),
+                    'propertyType':    p.get('commercialorresidential'),  # Residential / Commercial
+                    'councilDistrict': p.get('council_district'),
+                    'city':            'Philadelphia',
+                    'state':           'PA',
+                    'source':          'philadelphia_arcgis',
                 })
 
-            log.info(f'[Philadelphia] offset={offset} fetched={len(features)} solar_total={len(permits)}')
+            log.info(
+                f'[Philadelphia] offset={offset} '
+                f'fetched={len(features)} total={len(permits)}'
+            )
 
             if len(features) < page_size:
                 break
