@@ -41,17 +41,17 @@ def scrape_philadelphia_api(start_date: str, end_date: str) -> list:
     start_ts = f"{start_date} 00:00:00"
     end_ts   = f"{end_date} 23:59:59"
 
-    # Filter solar at the DB level — faster, less data transferred
+    # ArcGIS LIKE is case-insensitive by default — no LOWER() needed
     where = (
         f"permittype = 'ELECTRICAL' "
         f"AND permitissuedate >= '{start_ts}' "
         f"AND permitissuedate <= '{end_ts}' "
         f"AND ("
-        f"  LOWER(approvedscopeofwork) LIKE '%solar%' OR "
-        f"  LOWER(approvedscopeofwork) LIKE '%photovoltaic%' OR "
-        f"  LOWER(approvedscopeofwork) LIKE '%pv system%' OR "
-        f"  LOWER(approvedscopeofwork) LIKE '%pv module%' OR "
-        f"  LOWER(typeofwork) LIKE '%solar%'"
+        f"approvedscopeofwork LIKE '%solar%' OR "
+        f"approvedscopeofwork LIKE '%photovoltaic%' OR "
+        f"approvedscopeofwork LIKE '%pv system%' OR "
+        f"approvedscopeofwork LIKE '%pv module%' OR "
+        f"typeofwork LIKE '%solar%'"
         f")"
     )
 
@@ -81,8 +81,14 @@ def scrape_philadelphia_api(start_date: str, end_date: str) -> list:
             resp = requests.get(ARCGIS_URL, params=params, timeout=30)
             resp.raise_for_status()
 
-            if not resp.text.strip():
+            raw = resp.text.strip()
+            if not raw:
                 log.error('[Philadelphia] Empty response from ArcGIS')
+                break
+
+            # Log first 300 chars so we can debug non-JSON responses
+            if not raw.startswith('{'):
+                log.error(f'[Philadelphia] Non-JSON response: {raw[:300]}')
                 break
 
             data = resp.json()
