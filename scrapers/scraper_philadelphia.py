@@ -1,15 +1,20 @@
 """
 Philadelphia L&I Permit Scraper
-Uses the Philadelphia ArcGIS Feature Service — no JavaScript required.
+Scrapes solar electrical permits from the Philadelphia open data platform.
 
 Data returned per permit:
   - address + zip (full mailing address)
   - opa_owner (property owner name — the homeowner)
-  - approvedscopeofwork (system size, panel model, inverter)
+  - approvedscopeofwork / typeofwork (system size, panel model, inverter)
   - contractorname / contractoraddress1
   - status, issuedDate, propertyType (Residential/Commercial)
 
 Phone/email NOT in permit data — enriched downstream via Apollo/Hunter.
+
+Endpoint chain (tried in order):
+  1. data.phila.gov CARTO SQL API  — primary, official City of Philadelphia host
+  2. phl.carto.com CARTO SQL API   — legacy fallback, same dataset
+  3. ArcGIS FeatureServer          — last resort (service migrated, may be stale)
 """
 
 import requests
@@ -18,24 +23,38 @@ from datetime import datetime
 
 log = logging.getLogger(__name__)
 
-# Primary ArcGIS Feature Service URL
-# NOTE: The old org ID (fLeGjb7u4uXqeF9q) was Philadelphia's original ArcGIS Online org.
-# The dataset has been migrated — the current canonical layer is "LI PERMITS" on PHLmaps.
-# Try the new URL first; falls back to CARTO if empty.
+# ---------------------------------------------------------------------------
+# Endpoint configuration
+# ---------------------------------------------------------------------------
+
+# Primary: data.phila.gov hosts the official City CARTO SQL API
+CARTO_PRIMARY_URL = 'https://data.phila.gov/carto/api/v2/sql'
+
+# Legacy CARTO domain (same dataset, older subdomain)
+CARTO_LEGACY_URL = 'https://phl.carto.com/api/v2/sql'
+
+# Confirmed table name from OpenDataPhilly:
+# https://opendataphilly.org/datasets/licenses-and-inspections-building-and-zoning-permits/
+# Direct download URL uses: phl.carto.com/api/v2/sql?q=SELECT * FROM li_permits
+CARTO_TABLE = 'li_permits'
+
+# ArcGIS FeatureServer — last resort. The original org ID (fLeGjb7u4uXqeF9q)
+# hosted the old 'permits' service which went dead. 'LI_PERMITS' is the current
+# layer name on PHLmaps (data-phl.opendata.arcgis.com/maps/phl::li-permits).
+# To get the current org ID: open that page, DevTools > Network, look for
+# a request to services.arcgis.com/.../LI_PERMITS/FeatureServer
 ARCGIS_URL = (
     'https://services.arcgis.com/fLeGjb7u4uXqeF9q/arcgis/rest/services'
     '/LI_PERMITS/FeatureServer/0/query'
 )
 
-# Official Philadelphia L&I permits via CARTO SQL API (OpenDataPhilly canonical source).
-# Table name confirmed: li_permits  (https://phl.carto.com/api/v2/sql)
-# Docs: https://opendataphilly.org/datasets/licenses-and-inspections-building-and-zoning-permits/
-PHILLY_ODP_URL = 'https://phl.carto.com/api/v2/sql'
-PHILLY_CARTO_TABLE = 'li_permits'
 
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
 
 def _normalize_permit(p: dict, source: str) -> dict:
-    """Normalize a raw permit attribute dict into the standard output shape."""
+    """Normalize a raw permit row into the standard output shape."""
     issued = p.get('permitissuedate')
     # ArcGIS returns epoch milliseconds; CARTO returns ISO strings
     if isinstance(issued, (int, float)) and issued:
@@ -47,12 +66,19 @@ def _normalize_permit(p: dict, source: str) -> dict:
     zip_code     = p.get('zip', '') or ''
     full_address = f"{address}, Philadelphia, PA {zip_code}".strip(', ')
 
+    # CARTO uses 'typeofwork'; ArcGIS has both 'typeofwork' and 'approvedscopeofwork'
+    description = (
+        p.get('approvedscopeofwork')
+        or p.get('typeofwork')
+        or p.get('permitdescription')
+    )
+
     return {
         'permitNumber':    p.get('permitnumber'),
         'address':         full_address,
         'streetAddress':   address,
         'zip':             zip_code,
-        'description':     p.get('approvedscopeofwork') or p.get('typeofwork'),
+        'description':     description,
         'status':          p.get('status'),
         'issuedDate':      issued,
         'ownerName':       p.get('opa_owner'),
@@ -67,11 +93,90 @@ def _normalize_permit(p: dict, source: str) -> dict:
     }
 
 
-def _scrape_via_arcgis(start_date: str, end_date: str) -> list:
+# ---------------------------------------------------------------------------
+# Scrape via CARTO SQL API
+# ---------------------------------------------------------------------------
+
+def _scrape_via_carto(start_date: str, end_date: str,
+                      base_url: str, source_label: str) -> tuple:
     """
-    Primary path: Philadelphia ArcGIS Feature Service.
+    Query the CARTO SQL API for solar electrical permits.
     Returns (permits_list, success_bool).
     """
+    log.info('[Philadelphia/%s] Querying %s', source_label, base_url)
+
+    sql = (
+        f"SELECT permitnumber, address, zip, permittype, typeofwork, "
+        f"approvedscopeofwork, status, permitissuedate, "
+        f"commercialorresidential, opa_owner, opa_account_num, "
+        f"contractorname, contractoraddress1, council_district "
+        f"FROM {CARTO_TABLE} "
+        f"WHERE permittype = 'ELECTRICAL' "
+        f"AND permitissuedate >= '{start_date}' "
+        f"AND permitissuedate <= '{end_date} 23:59:59' "
+        f"AND ("
+        f"  typeofwork ILIKE '%solar%' OR "
+        f"  typeofwork ILIKE '%photovoltaic%' OR "
+        f"  typeofwork ILIKE '%pv system%' OR "
+        f"  typeofwork ILIKE '%pv module%' OR "
+        f"  approvedscopeofwork ILIKE '%solar%' OR "
+        f"  approvedscopeofwork ILIKE '%photovoltaic%' OR "
+        f"  approvedscopeofwork ILIKE '%pv system%' OR "
+        f"  approvedscopeofwork ILIKE '%pv module%'"
+        f") "
+        f"ORDER BY permitissuedate DESC "
+        f"LIMIT 5000"
+    )
+
+    try:
+        resp = requests.get(base_url, params={'q': sql, 'format': 'json'}, timeout=30)
+        resp.raise_for_status()
+
+        raw = resp.text.strip()
+        if not raw:
+            log.error('[Philadelphia/%s] Empty response body (HTTP %s)',
+                      source_label, resp.status_code)
+            return [], False
+
+        if not raw.startswith('{'):
+            log.error('[Philadelphia/%s] Non-JSON response (first 300 chars): %s',
+                      source_label, raw[:300])
+            return [], False
+
+        data = resp.json()
+
+        if 'error' in data:
+            log.error('[Philadelphia/%s] API error: %s', source_label, data['error'])
+            return [], False
+
+        rows = data.get('rows', [])
+        permits = [_normalize_permit(r, source=f'philadelphia_{source_label.lower()}')
+                   for r in rows]
+        log.info('[Philadelphia/%s] fetched=%d', source_label, len(permits))
+        return permits, True
+
+    except requests.exceptions.RequestException as e:
+        log.error('[Philadelphia/%s] Request failed: %s', source_label, e)
+        return [], False
+    except ValueError as e:
+        log.error('[Philadelphia/%s] JSON parse error: %s', source_label, e)
+        return [], False
+    except Exception as e:
+        log.error('[Philadelphia/%s] Unexpected error: %s', source_label, e)
+        return [], False
+
+
+# ---------------------------------------------------------------------------
+# Scrape via ArcGIS FeatureServer (last resort)
+# ---------------------------------------------------------------------------
+
+def _scrape_via_arcgis(start_date: str, end_date: str) -> tuple:
+    """
+    ArcGIS FeatureServer fallback. Paginates up to 1000 records per page.
+    Returns (permits_list, success_bool).
+    """
+    log.info('[Philadelphia/ArcGIS] Trying FeatureServer fallback')
+
     start_ts = f"{start_date} 00:00:00"
     end_ts   = f"{end_date} 23:59:59"
 
@@ -116,8 +221,10 @@ def _scrape_via_arcgis(start_date: str, end_date: str) -> list:
 
             raw = resp.text.strip()
             if not raw:
-                log.error('[Philadelphia/ArcGIS] Empty response body (HTTP %s). '
-                          'The service URL may have moved.', resp.status_code)
+                log.error('[Philadelphia/ArcGIS] Empty response (HTTP %s) — '
+                          'service URL may have moved. Check: '
+                          'https://data-phl.opendata.arcgis.com/maps/phl::li-permits',
+                          resp.status_code)
                 return permits, False
 
             if not raw.startswith('{'):
@@ -159,60 +266,18 @@ def _scrape_via_arcgis(start_date: str, end_date: str) -> list:
     return permits, True
 
 
-def _scrape_via_carto(start_date: str, end_date: str) -> list:
-    """
-    Fallback path: Philadelphia Open Data via CARTO SQL API.
-    Same underlying permit dataset, different endpoint.
-    """
-    log.info('[Philadelphia/CARTO] Falling back to CARTO endpoint')
-
-    sql = (
-        "SELECT permitnumber, address, zip, permittype, typeofwork, "
-        "approvedscopeofwork, status, permitissuedate, "
-        "commercialorresidential, opa_owner, opa_account_num, "
-        "contractorname, contractoraddress1, council_district "
-        f"FROM {PHILLY_CARTO_TABLE} "
-        "WHERE permittype = 'ELECTRICAL' "
-        f"AND permitissuedate >= '{start_date}' "
-        f"AND permitissuedate <= '{end_date} 23:59:59' "
-        "AND ("
-        "approvedscopeofwork ILIKE '%solar%' OR "
-        "approvedscopeofwork ILIKE '%photovoltaic%' OR "
-        "approvedscopeofwork ILIKE '%pv system%' OR "
-        "approvedscopeofwork ILIKE '%pv module%' OR "
-        "typeofwork ILIKE '%solar%'"
-        ") "
-        "ORDER BY permitissuedate DESC "
-        "LIMIT 5000"
-    )
-
-    try:
-        resp = requests.get(PHILLY_ODP_URL, params={'q': sql, 'format': 'json'},
-                            timeout=30)
-        resp.raise_for_status()
-
-        raw = resp.text.strip()
-        if not raw or not raw.startswith('{'):
-            log.error('[Philadelphia/CARTO] Unexpected response: %s', raw[:300])
-            return []
-
-        data = resp.json()
-        rows = data.get('rows', [])
-        permits = [_normalize_permit(r, source='philadelphia_carto') for r in rows]
-        log.info('[Philadelphia/CARTO] fetched=%d', len(permits))
-        return permits
-
-    except Exception as e:
-        log.error('[Philadelphia/CARTO] Failed: %s', e)
-        return []
-
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 
 def scrape_philadelphia_api(start_date: str, end_date: str) -> list:
     """
     Scrape Philadelphia solar electrical permits.
 
-    Tries the ArcGIS Feature Service first; if that returns empty/error,
-    falls back to the Philadelphia Open Data CARTO endpoint.
+    Tries endpoints in order:
+      1. data.phila.gov CARTO (primary)
+      2. phl.carto.com CARTO (legacy fallback)
+      3. ArcGIS FeatureServer (last resort)
 
     Args:
         start_date: 'YYYY-MM-DD'
@@ -223,11 +288,24 @@ def scrape_philadelphia_api(start_date: str, end_date: str) -> list:
     """
     log.info('[Philadelphia] Scraping %s to %s', start_date, end_date)
 
-    permits, arcgis_ok = _scrape_via_arcgis(start_date, end_date)
+    # 1. Primary CARTO endpoint
+    permits, ok = _scrape_via_carto(start_date, end_date,
+                                    CARTO_PRIMARY_URL, 'CARTO_PRIMARY')
+    if ok:
+        log.info('[Philadelphia] Done via primary CARTO — %d solar permits', len(permits))
+        return permits
 
-    if not arcgis_ok and not permits:
-        log.warning('[Philadelphia] ArcGIS failed — trying CARTO fallback')
-        permits = _scrape_via_carto(start_date, end_date)
+    # 2. Legacy CARTO endpoint
+    log.warning('[Philadelphia] Primary CARTO failed — trying legacy phl.carto.com')
+    permits, ok = _scrape_via_carto(start_date, end_date,
+                                    CARTO_LEGACY_URL, 'CARTO_LEGACY')
+    if ok:
+        log.info('[Philadelphia] Done via legacy CARTO — %d solar permits', len(permits))
+        return permits
 
-    log.info('[Philadelphia] Done — %d solar permits', len(permits))
+    # 3. ArcGIS last resort
+    log.warning('[Philadelphia] Both CARTO endpoints failed — trying ArcGIS FeatureServer')
+    permits, ok = _scrape_via_arcgis(start_date, end_date)
+
+    log.info('[Philadelphia] Done — %d solar permits (arcgis_ok=%s)', len(permits), ok)
     return permits
